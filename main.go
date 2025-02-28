@@ -1,230 +1,37 @@
-// Gor is simple http traffic replication tool written in Go. Its main goal to replay traffic from production servers to staging and dev environments.
-// Now you can test your code on real user sessions in an automated and repeatable fashion.
 package main
 
 import (
-	"expvar"
-	"flag"
-	"fmt"
-	"github.com/buger/goreplay/core"
-	"github.com/buger/goreplay/glogs"
-	"github.com/buger/goreplay/input"
-	"github.com/buger/goreplay/output"
-	"github.com/buger/goreplay/settings"
-	"github.com/buger/goreplay/version"
-	"log"
-	"net/http"
-	"net/http/httputil"
-	httppptof "net/http/pprof"
-	"os"
-	"os/signal"
-	"runtime"
-	"runtime/pprof"
-	"syscall"
-	"time"
+	"github.com/buger/routers"
+	"github.com/buger/utils"
+	"html/template"
+
+	"github.com/gin-contrib/sessions"
+	"github.com/gin-contrib/sessions/redis"
+	"github.com/gin-gonic/gin"
 )
-
-var (
-	cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
-	memprofile = flag.String("memprofile", "", "write memory profile to this file")
-)
-
-func init() {
-	var defaultServeMux http.ServeMux
-	http.DefaultServeMux = &defaultServeMux
-
-	http.HandleFunc("/debug/vars", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		fmt.Fprintf(w, "{\n")
-		first := true
-		expvar.Do(func(kv expvar.KeyValue) {
-			if kv.Key == "memstats" || kv.Key == "cmdline" {
-				return
-			}
-
-			if !first {
-				fmt.Fprintf(w, ",\n")
-			}
-			first = false
-			fmt.Fprintf(w, "%q: %s", kv.Key, kv.Value)
-		})
-		fmt.Fprintf(w, "\n}\n")
-	})
-
-	http.HandleFunc("/debug/pprof/", httppptof.Index)
-	http.HandleFunc("/debug/pprof/cmdline", httppptof.Cmdline)
-	http.HandleFunc("/debug/pprof/profile", httppptof.Profile)
-	http.HandleFunc("/debug/pprof/symbol", httppptof.Symbol)
-	http.HandleFunc("/debug/pprof/trace", httppptof.Trace)
-}
-
-func loggingMiddleware(addr string, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/loop" {
-			_, err := http.Get("http://" + addr)
-			log.Println(err)
-		}
-
-		rb, _ := httputil.DumpRequest(r, false)
-		log.Println(string(rb))
-		next.ServeHTTP(w, r)
-	})
-}
 
 func main() {
-	if os.Getenv("GOMAXPROCS") == "" {
-		runtime.GOMAXPROCS(runtime.NumCPU() * 2)
-	}
+	// 创建一个默认的路由引擎
+	r := gin.Default()
 
-	args := os.Args[1:]
-	var plugins *core.InOutPlugins
-	if len(args) > 0 && args[0] == "file-server" {
-		if len(args) != 2 {
-			log.Fatal("You should specify port and IP (optional) for the file server. Example: `gor file-server :80`")
-		}
-		dir, _ := os.Getwd()
+	// 自定义模板函数  注意要把这个函数放在加载模板前
+	r.SetFuncMap(template.FuncMap{
+		"UnixToTime": utils.UnixToTime,
+	})
 
-		glogs.Debug(0, "Started example file server for current directory on address ", args[1])
+	// 加载模板 放在配置路由前面
+	//r.LoadHTMLGlob("templates/**/*")
 
-		log.Fatal(http.ListenAndServe(args[1], loggingMiddleware(args[1], http.FileServer(http.Dir(dir)))))
-	} else {
-		flag.Parse()
-		settings.CheckSettings()
-		plugins = NewPlugins()
-	}
+	// 配置静态web目录   第一个参数表示路由, 第二个参数表示映射的目录
+	r.Static("/static", "./static")
 
-	log.Printf("[PPID %d and PID %d] Version:%s\n", os.Getppid(), os.Getpid(), version.VERSION)
+	// 配置session中间件
+	store, _ := redis.NewStore(10, "tcp", "localhost:6379", "", []byte("secret111"))
+	r.Use(sessions.Sessions("user-session", store))
 
-	if len(plugins.Inputs) == 0 || len(plugins.Outputs) == 0 {
-		log.Fatal("Required at least 1 input and 1 output")
-	}
+	// 初始化流量录制controller
+	routers.GoReplayRoutersInit(r)
 
-	if *memprofile != "" {
-		profileMEM(*memprofile)
-	}
-
-	if *cpuprofile != "" {
-		profileCPU(*cpuprofile)
-	}
-
-	if settings.Settings.Pprof != "" {
-		go func() {
-			log.Println(http.ListenAndServe(settings.Settings.Pprof, nil))
-		}()
-	}
-
-	closeCh := make(chan int)
-	emitter := core.NewEmitter()
-	go emitter.Start(plugins, settings.Settings.Middleware)
-	if settings.Settings.ExitAfter > 0 {
-		log.Printf("Running gor for a duration of %s\n", settings.Settings.ExitAfter)
-
-		time.AfterFunc(settings.Settings.ExitAfter, func() {
-			log.Printf("gor run timeout %s\n", settings.Settings.ExitAfter)
-			close(closeCh)
-		})
-	}
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-	exit := 0
-	select {
-	case <-c:
-		exit = 1
-	case <-closeCh:
-		exit = 0
-	}
-	emitter.Close()
-	os.Exit(exit)
-}
-
-func profileCPU(cpuprofile string) {
-	if cpuprofile != "" {
-		f, err := os.Create(cpuprofile)
-		if err != nil {
-			log.Fatal(err)
-		}
-		pprof.StartCPUProfile(f)
-
-		time.AfterFunc(30*time.Second, func() {
-			pprof.StopCPUProfile()
-			f.Close()
-		})
-	}
-}
-
-func profileMEM(memprofile string) {
-	if memprofile != "" {
-		f, err := os.Create(memprofile)
-		if err != nil {
-			log.Fatal(err)
-		}
-		time.AfterFunc(30*time.Second, func() {
-			pprof.WriteHeapProfile(f)
-			f.Close()
-		})
-	}
-}
-
-// NewPlugins specify and initialize all available plugins
-func NewPlugins() *core.InOutPlugins {
-	plugins := new(core.InOutPlugins)
-
-	for _, options := range settings.Settings.InputDummy {
-		plugins.RegisterPlugin(input.NewDummyInput, options)
-	}
-
-	for range settings.Settings.OutputDummy {
-		plugins.RegisterPlugin(output.NewDummyOutput)
-	}
-
-	if settings.Settings.OutputStdout {
-		plugins.RegisterPlugin(output.NewDummyOutput)
-	}
-
-	if settings.Settings.OutputNull {
-		plugins.RegisterPlugin(output.NewNullOutput)
-	}
-
-	for _, options := range settings.Settings.InputRAW {
-		plugins.RegisterPlugin(input.NewRAWInput, options, settings.Settings.InputRAWConfig)
-	}
-
-	for _, options := range settings.Settings.InputTCP {
-		plugins.RegisterPlugin(input.NewTCPInput, options, &settings.Settings.InputTCPConfig)
-	}
-
-	for _, options := range settings.Settings.OutputTCP {
-		plugins.RegisterPlugin(output.NewTCPOutput, options, &settings.Settings.OutputTCPConfig)
-	}
-
-	for _, options := range settings.Settings.OutputWebSocket {
-		plugins.RegisterPlugin(output.NewWebSocketOutput, options, &settings.Settings.OutputWebSocketConfig)
-	}
-
-	for _, options := range settings.Settings.InputFile {
-		plugins.RegisterPlugin(input.NewFileInput, options, settings.Settings.InputFileLoop, settings.Settings.InputFileReadDepth, settings.Settings.InputFileMaxWait, settings.Settings.InputFileDryRun)
-	}
-
-	for _, path := range settings.Settings.OutputFile {
-		plugins.RegisterPlugin(output.NewFileOutput, path, &settings.Settings.OutputFileConfig)
-	}
-
-	for _, options := range settings.Settings.InputHTTP {
-		plugins.RegisterPlugin(input.NewHTTPInput, options)
-	}
-
-	// If we explicitly set Host header http output should not rewrite it
-	// Fix: https://github.com/buger/gor/issues/174
-	for _, header := range settings.Settings.ModifierConfig.Headers {
-		if header.Name == "Host" {
-			settings.Settings.OutputHTTPConfig.OriginalHost = true
-			break
-		}
-	}
-
-	for _, options := range settings.Settings.OutputHTTP {
-		plugins.RegisterPlugin(output.NewHTTPOutput, options, &settings.Settings.OutputHTTPConfig)
-	}
-
-	return plugins
+	// 启动 HTTP 服务器
+	r.Run(":9001")
 }
