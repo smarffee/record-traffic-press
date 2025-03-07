@@ -1,0 +1,25 @@
+env: dev
+project_name: record-traffic-press
+db:
+  - name: traffic
+    db_name: record_traffic_press
+    host: 127.0.0.1
+    port: 3306
+    user: root
+    password: "123456"
+    type: mysql
+#  - name: tencent_crm
+#    db_name: TencentCRM_Test
+#    host: 9.134.177.215
+#    port: 1433
+#    user: neofsun
+#    password: "qNYJz@5893hycD"
+#    type: sqlserver
+redis:
+  name: redis
+  host: 127.0.0.1
+  port: 6379
+  password:
+  max_pool_size: 100
+  min_pool_size: 10
+  fix: traffic_

@@ -47,7 +47,7 @@ type AppSettings struct {
 	OutputFile         []string      `json:"output-file"`
 	OutputFileConfig   FileOutputConfig
 
-	InputRAW       []string `json:"input_raw"`
+	InputRAW       []string `json:"input-raw"`
 	InputRAWConfig RAWInputConfig
 
 	Middleware string `json:"middleware"`
@@ -93,7 +93,7 @@ type FileOutputConfig struct {
 	QueueLimit        int           `json:"output-file-queue-limit"`
 	Append            bool          `json:"output-file-append"`
 	BufferPath        string        `json:"output-file-buffer"`
-	OnClose           func(string)
+	OnClose           func(string)  `json:"-"`
 }
 
 // WebSocketOutputConfig WebSocket output configuration
@@ -132,8 +132,8 @@ type HTTPOutputConfig struct {
 	CompatibilityMode bool          `json:"output-http-compatibility-mode"`
 	RequestGroup      string        `json:"output-http-request-group"`
 	Debug             bool          `json:"output-http-debug"`
-	RawURL            string
-	Url               *url.URL
+	RawURL            string        `json:"-"`
+	Url               *url.URL      `json:"-"`
 }
 
 func (hoc *HTTPOutputConfig) Copy() *HTTPOutputConfig {
